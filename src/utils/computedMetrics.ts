@@ -231,6 +231,23 @@ export function getRevenue(metrics: any): number {
 }
 
 /**
+ * Completed registrations from the Meta actions array.
+ * Priority: complete_registration → omni_complete_registration →
+ * offsite_conversion.fb_pixel_complete_registration.
+ * Ref: https://www.facebook.com/business/help/350128498372094
+ */
+export function getRegistrations(metrics: any): number {
+  if (!metrics) return 0;
+
+  const actions = metrics.actions || [];
+
+  return getActionValue(actions, 'complete_registration') ||
+         getActionValue(actions, 'omni_complete_registration') ||
+         getActionValue(actions, 'offsite_conversion.fb_pixel_complete_registration') ||
+         0;
+}
+
+/**
  * Calculate metrics for a specific time window from insights data
  */
 export interface TimeWindowMetrics {
