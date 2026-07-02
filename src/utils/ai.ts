@@ -5,7 +5,9 @@ import { calculateCampaignHealth, OptimizationInsight } from './campaignOptimize
 
 // Shared model for every Claude call in this file — same as Clone Winner.
 // Ref: https://docs.anthropic.com/en/api/messages
-const CLAUDE_MODEL = 'claude-sonnet-4-20250514';
+// NOTE: claude-sonnet-5 rejects non-default temperature/top_p/top_k — do not
+// add sampling params back; steer output via the prompts instead.
+const CLAUDE_MODEL = 'claude-sonnet-5';
 const ANTHROPIC_VERSION = '2023-06-01';
 
 /**
@@ -16,19 +18,18 @@ const ANTHROPIC_VERSION = '2023-06-01';
 async function callClaudeJSON<T = any>(
   systemPrompt: string,
   userPrompt: string,
-  opts: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
+  opts: { maxTokens?: number; timeoutMs?: number } = {},
 ): Promise<T> {
   if (!config.anthropic.apiKey) {
     throw new Error('Anthropic API key is not configured. Please add ANTHROPIC_API_KEY to your environment variables.');
   }
-  const { maxTokens = 2048, temperature = 0.4, timeoutMs = 60000 } = opts;
+  const { maxTokens = 2048, timeoutMs = 60000 } = opts;
 
   const response = await axios.post(
     'https://api.anthropic.com/v1/messages',
     {
       model: CLAUDE_MODEL,
       max_tokens: maxTokens,
-      temperature,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt + '\n\nReturn ONLY valid JSON. No preamble, no markdown fences.' }],
     },
@@ -61,19 +62,18 @@ async function callClaudeJSON<T = any>(
 export async function callClaudeText(
   systemPrompt: string,
   userPrompt: string,
-  opts: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
+  opts: { maxTokens?: number; timeoutMs?: number } = {},
 ): Promise<string> {
   if (!config.anthropic.apiKey) {
     throw new Error('Anthropic API key is not configured.');
   }
-  const { maxTokens = 1024, temperature = 0.5, timeoutMs = 45000 } = opts;
+  const { maxTokens = 1024, timeoutMs = 45000 } = opts;
 
   const response = await axios.post(
     'https://api.anthropic.com/v1/messages',
     {
       model: CLAUDE_MODEL,
       max_tokens: maxTokens,
-      temperature,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
     },
@@ -386,7 +386,7 @@ export async function generateRuleFromNaturalLanguage(
   userPrompt += `\n\nCreate a ${mode === 'advanced' ? 'sophisticated' : 'simple'} rule based on this request.`;
 
   try {
-    const parsed = await callClaudeJSON<GeneratedRule>(systemPrompt, userPrompt, { temperature: 0.3, timeoutMs: 30000 });
+    const parsed = await callClaudeJSON<GeneratedRule>(systemPrompt, userPrompt, { timeoutMs: 30000 });
     if (!parsed.rule_name || !parsed.filter_config || !parsed.action) {
       throw new Error('Invalid rule structure from AI');
     }
@@ -722,7 +722,7 @@ ${JSON.stringify(adSetsSummary, null, 2)}
 
 Focus exclusively on strategies that will INCREASE the number of conversions and IMPROVE conversion rates.`;
 
-  return callClaudeJSON(systemPrompt, userPrompt, { temperature: 0.4, timeoutMs: 60000, maxTokens: 4000 });
+  return callClaudeJSON(systemPrompt, userPrompt, { timeoutMs: 60000, maxTokens: 4000 });
 }
 
 // ── Creative Analysis with AI ────────────────────────────────────────────
@@ -846,7 +846,7 @@ BENCHMARKS:
 Based on these metrics, provide your analysis. Be specific about what's working, what's not, and what to do next. Reference the actual numbers.`;
 
   try {
-    const parsed = await callClaudeJSON<CreativeAnalysisResult>(systemPrompt, userPrompt, { temperature: 0.5, timeoutMs: 30000, maxTokens: 2048 });
+    const parsed = await callClaudeJSON<CreativeAnalysisResult>(systemPrompt, userPrompt, { timeoutMs: 30000, maxTokens: 2048 });
     if (parsed.analysis && parsed.brief && Array.isArray(parsed.hooks)) {
       return parsed;
     }
