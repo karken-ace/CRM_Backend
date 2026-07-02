@@ -1,8 +1,7 @@
 import { Router, Response } from 'express';
-import axios from 'axios';
 import { Agent } from '../models';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
-import { config } from '../config';
+import { agentClient } from '../utils/agentClient';
 
 const router = Router();
 
@@ -37,11 +36,7 @@ router.post('/trigger', authenticate, requireRoles('USER', 'ADMIN'), async (req:
     // L2 cache or a brief Meta throttle this can take ~30-60s; longer than
     // that almost always means Meta is rate-limited and the next scheduled
     // loop will pick up.
-    const response = await axios.post(
-      `${config.agent.baseUrl}/sync/trigger`,
-      {},
-      { timeout: 60_000 }
-    );
+    const response = await agentClient(agent).post('/sync/trigger', {}, { timeout: 60_000 });
     res.json(response.data);
   } catch (error: any) {
     if (error.code === 'ECONNABORTED') {

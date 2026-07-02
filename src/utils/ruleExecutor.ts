@@ -1,6 +1,5 @@
-import axios from 'axios';
 import { Agent, ActionLog } from '../models';
-import { config } from '../config';
+import { agentClient, agentBaseUrl } from './agentClient';
 import { generateId } from './index';
 
 // Helper function for consistent conversion extraction from Meta actions array
@@ -443,16 +442,16 @@ export async function executeRule(rule: any, actor: string = 'auto'): Promise<an
     throw new Error('Agent not found or offline');
   }
 
-  const agentUrl = `${config.agent.baseUrl}/meta/campaigns/${rule.campaign_id}/adsets`;
+  const client = agentClient(agent);
   let adSetsResponse;
   try {
-    adSetsResponse = await axios.get(agentUrl, { timeout: 15000 });
+    adSetsResponse = await client.get(`/meta/campaigns/${rule.campaign_id}/adsets`, { timeout: 15000 });
   } catch (error: any) {
     if (error.code === 'ECONNABORTED') {
       throw new Error('Agent request timed out');
     }
     if (error.code === 'ECONNREFUSED') {
-      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + config.agent.baseUrl);
+      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + agentBaseUrl(agent));
     }
     if (error.response) {
       throw new Error(`Agent returned error: ${error.response.status} ${error.response.statusText}`);
@@ -475,9 +474,8 @@ export async function executeRule(rule: any, actor: string = 'auto'): Promise<an
   for (const adSet of matchingAdSets) {
     try {
       const newStatus = rule.action.type === 'PAUSE' ? 'PAUSED' : 'ACTIVE';
-      const updateUrl = `${config.agent.baseUrl}/meta/adsets/${adSet.id}/status`;
-      
-      const response = await axios.put(updateUrl, { status: newStatus }, { timeout: 10000 });
+
+      const response = await client.put(`/meta/adsets/${adSet.id}/status`, { status: newStatus }, { timeout: 10000 });
       
       // Check for application-level errors in the response
       if (response.data && response.data.status === 'error') {

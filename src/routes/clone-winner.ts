@@ -13,7 +13,7 @@ import { Router, Response } from 'express';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
 import { Agent, CreativeAnalysis, ConceptCache } from '../models';
 import { config } from '../config';
-import axios from 'axios';
+import { agentClient } from '../utils/agentClient';
 import { generateConcepts, PerformanceData } from '../utils/cloneWinner';
 
 const router = Router();
@@ -226,14 +226,14 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRe
       } else {
         try {
           // Use local video endpoint if demo_video_path is provided
-          const agentUrl = demo_video_path
-            ? `${config.agent.baseUrl}/meta/creatives/clone-analyze-local`
-            : `${config.agent.baseUrl}/meta/creatives/clone-analyze`;
+          const agentPath = demo_video_path
+            ? '/meta/creatives/clone-analyze-local'
+            : '/meta/creatives/clone-analyze';
           const agentBody = demo_video_path
             ? { video_path: demo_video_path, creative_name: req.body.ad_name || 'Demo Ad' }
             : { creative_id, ad_id }; // ad_id lets the agent fall back to preview-iframe extraction when source_url is gated
-          const agentResponse = await axios.post(
-            agentUrl,
+          const agentResponse = await agentClient(agent).post(
+            agentPath,
             agentBody,
             { timeout: 180000 }
           );

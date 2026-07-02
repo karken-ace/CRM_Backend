@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import { Agent, AdAccount, Command, CommandResult } from '../models';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
+import { agentRateLimiter } from '../middleware';
 import { generateId } from '../utils';
 import { createToken } from '../utils/security';
 import { config } from '../config';
@@ -9,6 +10,22 @@ import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 
 const router = Router();
+
+/** Agent responses must never carry credentials — the plaintext token is
+ *  returned exactly once (creation / rotation) via the bootstrap object. */
+function sanitizeAgent(agent: any): any {
+  const obj = typeof agent.toObject === 'function' ? agent.toObject() : { ...agent };
+  delete obj.token;
+  delete obj.token_hash;
+  return obj;
+}
+
+function bootstrapFor(agentId: string, plainToken: string) {
+  return {
+    token: plainToken,
+    docker_run: `docker run -d --name sm-agent --restart unless-stopped -e AGENT_ID=${agentId} -e AGENT_TOKEN=${plainToken} ghcr.io/seven-media/sm-agent:latest`,
+  };
+}
 
 // List agents
 router.get('/', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
@@ -20,19 +37,7 @@ router.get('/', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthReq
       agents = await Agent.find({ user_id: req.user!.id });
     }
 
-    const agentsResponse = agents.map(agent => {
-      const agentObj = agent.toObject();
-      const bootstrap: any = {};
-      
-      if (agent.token) {
-        bootstrap.token = '[HIDDEN]';
-        bootstrap.docker_run = `docker run -d --name sm-agent --restart unless-stopped -e AGENT_ID=${agent.id} -e AGENT_TOKEN=[HIDDEN] ghcr.io/seven-media/sm-agent:latest`;
-      }
-      
-      return { ...agentObj, bootstrap };
-    });
-
-    res.json(agentsResponse);
+    res.json(agents.map(sanitizeAgent));
   } catch (error) {
     console.error('List agents error:', error);
     res.status(500).json({ detail: 'Internal server error' });
@@ -53,15 +58,7 @@ router.get('/:agent_id', authenticate, requireRoles('USER', 'ADMIN'), async (req
       return res.status(403).json({ detail: 'Access denied' });
     }
 
-    const agentObj = agent.toObject();
-    const bootstrap: any = {};
-    
-    if (agent.token) {
-      bootstrap.token = agent.token;
-      bootstrap.docker_run = `docker run -d --name sm-agent --restart unless-stopped -e AGENT_ID=${agent.id} -e AGENT_TOKEN=${agent.token} ghcr.io/seven-media/sm-agent:latest`;
-    }
-    
-    res.json({ ...agentObj, bootstrap });
+    res.json(sanitizeAgent(agent));
   } catch (error) {
     console.error('Get agent error:', error);
     res.status(500).json({ detail: 'Internal server error' });
@@ -73,6 +70,7 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), [
   body('name').notEmpty(),
   body('user_id').optional(),
   body('allowed_ip').optional(),
+  body('base_url').optional({ checkFalsy: true }).isURL({ protocols: ['http', 'https'], require_tld: false, require_protocol: true }),
 ], async (req: AuthRequest, res: Response) => {
   try {
     const errors = validationResult(req);
@@ -80,7 +78,7 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { name, user_id, allowed_ip } = req.body;
+    const { name, user_id, allowed_ip, base_url } = req.body;
     let agent_id = `agent-${uuidv4().substring(0, 8)}`;
 
     // Check if generated ID already exists
@@ -97,7 +95,8 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), [
       return res.status(403).json({ detail: 'Can only create agents for yourself' });
     }
 
-    // Generate token
+    // Generate token — the plaintext is returned once in this response and
+    // never stored; only the bcrypt hash is persisted.
     const plain = require('crypto').randomBytes(24).toString('base64url');
     const token_hash = await bcrypt.hash(plain, 10);
 
@@ -107,19 +106,13 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), [
       name,
       status: 'OFFLINE',
       allowed_ip,
-      token: plain,
+      base_url,
       token_hash,
     });
 
     await agent.save();
 
-    const agentObj: any = agent.toObject();
-    agentObj.bootstrap = {
-      token: plain,
-      docker_run: `docker run -d --name sm-agent --restart unless-stopped -e AGENT_ID=${agent.id} -e AGENT_TOKEN=${plain} ghcr.io/seven-media/sm-agent:latest`,
-    };
-
-    res.status(201).json(agentObj);
+    res.status(201).json({ ...sanitizeAgent(agent), bootstrap: bootstrapFor(agent.id, plain) });
   } catch (error) {
     console.error('Create agent error:', error);
     res.status(500).json({ detail: 'Internal server error' });
@@ -138,19 +131,16 @@ router.put('/:agent_id', authenticate, requireRoles('ADMIN'), async (req: AuthRe
 
     if (req.body.name) agent.name = req.body.name;
     if (req.body.allowed_ip !== undefined) agent.allowed_ip = req.body.allowed_ip;
-    if (req.body.bootstrap) (agent as any).bootstrap = req.body.bootstrap;
-
+    if (req.body.base_url !== undefined) {
+      const base_url = req.body.base_url;
+      if (base_url && !/^https?:\/\//.test(base_url)) {
+        return res.status(400).json({ detail: 'base_url must start with http:// or https://' });
+      }
+      agent.base_url = base_url || undefined;
+    }
     await agent.save();
 
-    const agentObj = agent.toObject();
-    const bootstrap: any = {};
-    
-    if (agent.token) {
-      bootstrap.token = agent.token;
-      bootstrap.docker_run = `docker run -d --name sm-agent --restart unless-stopped -e AGENT_ID=${agent.id} -e AGENT_TOKEN=${agent.token} ghcr.io/seven-media/sm-agent:latest`;
-    }
-    
-    res.json({ ...agentObj, bootstrap });
+    res.json(sanitizeAgent(agent));
   } catch (error) {
     console.error('Update agent error:', error);
     res.status(500).json({ detail: 'Internal server error' });
@@ -175,8 +165,35 @@ router.delete('/:agent_id', authenticate, requireRoles('ADMIN'), async (req: Aut
   }
 });
 
+// Rotate agent token — for when the one-time bootstrap token is lost or
+// compromised. Returns the new plaintext exactly once; only the hash persists.
+router.post('/:agent_id/token:rotate', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
+  try {
+    const { agent_id } = req.params;
+    const agent = await Agent.findOne({ id: agent_id });
+
+    if (!agent) {
+      return res.status(404).json({ detail: 'Agent not found' });
+    }
+
+    if (req.user!.role !== 'ADMIN' && agent.user_id !== req.user!.id) {
+      return res.status(403).json({ detail: 'Access denied' });
+    }
+
+    const plain = require('crypto').randomBytes(24).toString('base64url');
+    agent.token_hash = await bcrypt.hash(plain, 10);
+    agent.token = undefined; // clear any legacy plaintext
+    await agent.save();
+
+    res.json({ ...sanitizeAgent(agent), bootstrap: bootstrapFor(agent.id, plain) });
+  } catch (error) {
+    console.error('Rotate agent token error:', error);
+    res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
 // Heartbeat
-router.post('/:agent_id/heartbeat', async (req: AuthRequest, res: Response) => {
+router.post('/:agent_id/heartbeat', agentRateLimiter, async (req: AuthRequest, res: Response) => {
   try {
     const { agent_id } = req.params;
     const { message } = req.body;
@@ -214,7 +231,7 @@ router.post('/:agent_id/heartbeat', async (req: AuthRequest, res: Response) => {
 });
 
 // Pull config
-router.post('/:agent_id/config:pull', async (req: AuthRequest, res: Response) => {
+router.post('/:agent_id/config:pull', agentRateLimiter, async (req: AuthRequest, res: Response) => {
   try {
     const { agent_id } = req.params;
 
@@ -264,7 +281,7 @@ router.post('/:agent_id/config:pull', async (req: AuthRequest, res: Response) =>
 });
 
 // Pull commands
-router.post('/:agent_id/commands:pull', async (req: AuthRequest, res: Response) => {
+router.post('/:agent_id/commands:pull', agentRateLimiter, async (req: AuthRequest, res: Response) => {
   try {
     const { agent_id } = req.params;
 
@@ -319,7 +336,7 @@ router.post('/:agent_id/commands:pull', async (req: AuthRequest, res: Response) 
 });
 
 // Submit command result - need to verify agent differently
-router.post('/commands/:command_id/result', async (req: AuthRequest, res: Response) => {
+router.post('/commands/:command_id/result', agentRateLimiter, async (req: AuthRequest, res: Response) => {
   try {
     const { command_id } = req.params;
     const { started_at, finished_at, success, details } = req.body;

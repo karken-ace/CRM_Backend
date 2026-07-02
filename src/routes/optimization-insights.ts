@@ -6,8 +6,7 @@
 import { Router, Response } from 'express';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
 import { Agent, ActionLog } from '../models';
-import { config } from '../config';
-import axios from 'axios';
+import { agentClient } from '../utils/agentClient';
 import { generateId } from '../utils';
 import {
   BleedingBudgetDetector,
@@ -90,8 +89,7 @@ router.post('/analyze', authenticate, requireRoles('USER', 'ADMIN'), async (req:
     // which is the main reason this route returned zero recommendations
     // whenever Meta was rate-limited (the rate-limit cycle the dashboard
     // itself triggers).
-    const agentUrl = `${config.agent.baseUrl}/meta/campaigns/hierarchical?date_preset=last_30d`;
-    const response = await axios.get(agentUrl, { timeout: 60000 });
+    const response = await agentClient(agent).get('/meta/campaigns/hierarchical?date_preset=last_30d', { timeout: 60000 });
     const allCampaigns = response.data?.hierarchical_structure?.campaigns
       || response.data?.data?.campaigns
       || response.data?.campaigns
@@ -208,8 +206,7 @@ router.post('/module/:module_name', authenticate, requireRoles('USER', 'ADMIN'),
     }
     
     // Fetch ad sets data
-    const agentUrl = `${config.agent.baseUrl}/meta/campaigns/${campaign_id}/adsets?date_preset=last_30d`;
-    const response = await axios.get(agentUrl, { timeout: 15000 });
+    const response = await agentClient(agent).get(`/meta/campaigns/${campaign_id}/adsets?date_preset=last_30d`, { timeout: 15000 });
     const adSets = response.data?.ad_sets || response.data?.data || [];
 
     if (adSets.length === 0) {
@@ -388,19 +385,18 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
     const entityType: 'ad' | 'adset' = entity_type === 'ad' ? 'ad' : 'adset';
     const statusPath = entityType === 'ad' ? `ads/${entity_id}/status` : `adsets/${entity_id}/status`;
 
+    const client = agentClient(agent);
     let result;
 
     switch (action_type) {
       case 'pause': {
-        const url = `${config.agent.baseUrl}/meta/${statusPath}`;
-        const response = await axios.put(url, { status: 'PAUSED' }, { timeout: 15000 });
+        const response = await client.put(`/meta/${statusPath}`, { status: 'PAUSED' }, { timeout: 15000 });
         result = response.data;
         break;
       }
 
       case 'activate': {
-        const url = `${config.agent.baseUrl}/meta/${statusPath}`;
-        const response = await axios.put(url, { status: 'ACTIVE' }, { timeout: 15000 });
+        const response = await client.put(`/meta/${statusPath}`, { status: 'ACTIVE' }, { timeout: 15000 });
         result = response.data;
         break;
       }
@@ -413,11 +409,10 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
         if (!action_params || (!action_params.daily_budget && !action_params.lifetime_budget)) {
           return res.status(400).json({ detail: 'budget action requires daily_budget or lifetime_budget in action_params' });
         }
-        const budgetUrl = `${config.agent.baseUrl}/meta/adsets/${entity_id}/budget`;
         const budgetPayload: any = {};
         if (action_params.daily_budget) budgetPayload.daily_budget = action_params.daily_budget;
         if (action_params.lifetime_budget) budgetPayload.lifetime_budget = action_params.lifetime_budget;
-        const budgetResponse = await axios.put(budgetUrl, budgetPayload, { timeout: 15000 });
+        const budgetResponse = await client.put(`/meta/adsets/${entity_id}/budget`, budgetPayload, { timeout: 15000 });
         result = budgetResponse.data;
         break;
       }
@@ -426,8 +421,7 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
         // Permanent state — different from pause (Meta exposes a distinct
         // ARCHIVED status). Archived entities can't be re-activated; user
         // must duplicate to recover.
-        const url = `${config.agent.baseUrl}/meta/${statusPath}`;
-        const response = await axios.put(url, { status: 'ARCHIVED' }, { timeout: 15000 });
+        const response = await client.put(`/meta/${statusPath}`, { status: 'ARCHIVED' }, { timeout: 15000 });
         result = response.data;
         break;
       }
@@ -438,12 +432,11 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
         if (entityType !== 'adset') {
           return res.status(400).json({ detail: 'Duplicate is currently only supported for ad sets.' });
         }
-        const url = `${config.agent.baseUrl}/meta/adsets/${entity_id}/duplicate`;
         const body: any = {
           status_option: action_params?.status_option || 'PAUSED',
           rename_suffix: action_params?.rename_suffix || ' (Copy)',
         };
-        const response = await axios.post(url, body, { timeout: 20000 });
+        const response = await client.post(`/meta/adsets/${entity_id}/duplicate`, body, { timeout: 20000 });
         result = response.data;
         break;
       }
@@ -455,13 +448,12 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
         if (!action_params?.max_frequency) {
           return res.status(400).json({ detail: 'set_frequency_cap requires action_params.max_frequency' });
         }
-        const url = `${config.agent.baseUrl}/meta/adsets/${entity_id}/frequency-cap`;
         const body = {
           max_frequency: action_params.max_frequency,
           interval_days: action_params.interval_days || 7,
           event: action_params.event || 'IMPRESSIONS',
         };
-        const response = await axios.put(url, body, { timeout: 15000 });
+        const response = await client.put(`/meta/adsets/${entity_id}/frequency-cap`, body, { timeout: 15000 });
         result = response.data;
         break;
       }
@@ -473,10 +465,9 @@ router.post('/execute-action', authenticate, requireRoles('USER', 'ADMIN'), asyn
         if (!action_params?.bid_strategy) {
           return res.status(400).json({ detail: 'set_bid_strategy requires action_params.bid_strategy' });
         }
-        const url = `${config.agent.baseUrl}/meta/adsets/${entity_id}/bid-strategy`;
         const body: any = { bid_strategy: action_params.bid_strategy };
         if (action_params.bid_amount != null) body.bid_amount = action_params.bid_amount;
-        const response = await axios.put(url, body, { timeout: 15000 });
+        const response = await client.put(`/meta/adsets/${entity_id}/bid-strategy`, body, { timeout: 15000 });
         result = response.data;
         break;
       }

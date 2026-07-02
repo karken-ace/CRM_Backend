@@ -15,8 +15,7 @@ import {
   calculateCampaignStatistics,
   FIELD_CATEGORIES,
 } from '../utils/ruleExecutor';
-import axios from 'axios';
-import { config } from '../config';
+import { agentClient } from '../utils/agentClient';
 
 const router = Router();
 
@@ -107,11 +106,10 @@ router.post('/generate', authenticate, requireRoles('USER', 'ADMIN'), [
     let adSetsData: any[] = [];
     
     try {
-      const campaignsUrl = `${config.agent.baseUrl}/meta/test/hierarchical`;
-      const campaignsResponse = await axios.get(campaignsUrl, { timeout: 15000 });
+      const campaignsResponse = await agentClient(agent).get('/meta/test/hierarchical', { timeout: 15000 });
       const campaigns = campaignsResponse.data?.hierarchical_structure?.campaigns || [];
       campaignData = campaigns.find((c: any) => c.id === campaign_id);
-      
+
       if (campaignData) {
         adSetsData = campaignData.ad_sets || [];
       }
@@ -169,8 +167,7 @@ router.post('/analyze', authenticate, requireRoles('USER', 'ADMIN'), [
     let adSetsData: any[] = [];
     
     try {
-      const campaignsUrl = `${config.agent.baseUrl}/meta/test/hierarchical`;
-      const campaignsResponse = await axios.get(campaignsUrl, { timeout: 20000 });
+      const campaignsResponse = await agentClient(agent).get('/meta/test/hierarchical', { timeout: 20000 });
       const campaigns = campaignsResponse.data?.hierarchical_structure?.campaigns || [];
       campaignData = campaigns.find((c: any) => c.id === campaign_id);
       
@@ -219,10 +216,9 @@ router.post('/preview', authenticate, requireRoles('USER', 'ADMIN'), [
     }
 
     // Get ad sets from agent
-    const agentUrl = `${config.agent.baseUrl}/meta/campaigns/${campaign_id}/adsets`;
     let adSetsResponse;
     try {
-      adSetsResponse = await axios.get(agentUrl, { timeout: 15000 });
+      adSetsResponse = await agentClient(agent).get(`/meta/campaigns/${campaign_id}/adsets`, { timeout: 15000 });
     } catch (error: any) {
       return res.status(503).json({ detail: 'Failed to fetch ad sets from agent' });
     }
@@ -334,8 +330,7 @@ router.post('/', authenticate, requireRoles('USER', 'ADMIN'), [
       const evaluationSpec = convertToMetaEvaluationSpec(filter_config, campaign_id, 'LAST_7D');
       const executionSpec = convertToMetaExecutionSpec(action);
 
-      const metaRuleUrl = `${config.agent.baseUrl}/meta/rules`;
-      const metaResponse = await axios.post(metaRuleUrl, {
+      const metaResponse = await agentClient(agent).post('/meta/rules', {
         name: `[CRM] ${rule_name}`,  // Prefix to identify CRM-created rules
         evaluation_spec: evaluationSpec,
         execution_spec: executionSpec,
@@ -522,8 +517,8 @@ router.put('/:rule_id', authenticate, requireRoles('USER', 'ADMIN'), async (req:
       try {
         // Update Meta rule status (ENABLED/DISABLED)
         const metaStatus = rule.is_active ? 'ENABLED' : 'DISABLED';
-        const metaUpdateUrl = `${config.agent.baseUrl}/meta/rules/${rule.meta_rule_id}/status`;
-        const metaResponse = await axios.put(metaUpdateUrl, {
+        const ruleAgent = await Agent.findOne({ id: rule.agent_id });
+        const metaResponse = await agentClient(ruleAgent).put(`/meta/rules/${rule.meta_rule_id}/status`, {
           status: metaStatus
         }, { timeout: 15000 });
         metaUpdateResult = metaResponse.data;
@@ -565,8 +560,8 @@ router.delete('/:rule_id', authenticate, requireRoles('USER', 'ADMIN'), async (r
     // Also delete from Meta if the rule was created there
     if (rule.meta_rule_id) {
       try {
-        const metaDeleteUrl = `${config.agent.baseUrl}/meta/rules/${rule.meta_rule_id}`;
-        const metaResponse = await axios.delete(metaDeleteUrl, { timeout: 15000 });
+        const ruleAgent = await Agent.findOne({ id: rule.agent_id });
+        const metaResponse = await agentClient(ruleAgent).delete(`/meta/rules/${rule.meta_rule_id}`, { timeout: 15000 });
         metaDeleteResult = metaResponse.data;
       } catch (metaError: any) {
         console.error('Delete Meta rule error:', metaError);

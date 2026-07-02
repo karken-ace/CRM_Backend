@@ -7,6 +7,7 @@ export interface IAgent extends Document {
   status: string;
   last_heartbeat_at?: Date;
   allowed_ip?: string;
+  base_url?: string;
   token?: string;
   token_hash?: string;
 }
@@ -18,6 +19,7 @@ const AgentSchema = new Schema<IAgent>({
   status: { type: String, default: 'OFFLINE', required: true },
   last_heartbeat_at: { type: Date },
   allowed_ip: { type: String },
+  base_url: { type: String },
   token: { type: String },
   token_hash: { type: String },
 });

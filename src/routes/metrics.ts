@@ -1,12 +1,15 @@
 import { Router, Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
-import { MetricSnapshot, AdAccount, Campaign, AdSet, Ad } from '../models';
+import bcrypt from 'bcrypt';
+import { MetricSnapshot, AdAccount, Agent, Campaign, AdSet, Ad } from '../models';
+import { agentRateLimiter } from '../middleware';
 import { generateId } from '../utils';
 
 const router = Router();
 
-// Ingest metrics
-router.post('/metrics', [
+// Ingest metrics — authenticated with the sending agent's bearer token
+// (the agent assigned to the target ad account).
+router.post('/metrics', agentRateLimiter, [
   body('ad_account_id').notEmpty(),
   body('ts').isISO8601(),
   body('scope').isIn(['AD', 'AD_SET', 'CAMPAIGN']),
@@ -20,10 +23,26 @@ router.post('/metrics', [
 
     const { ad_account_id, ts, scope, items } = req.body;
 
-    // Called by Agent; trust based on IP allowlist handled at agent level per design
     const account = await AdAccount.findOne({ id: ad_account_id });
     if (!account) {
       return res.status(404).json({ detail: 'Ad account not found' });
+    }
+
+    // Verify the caller is the agent assigned to this ad account
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ detail: 'Missing token' });
+    }
+    if (!account.agent_id) {
+      return res.status(403).json({ detail: 'Ad account not assigned to an agent' });
+    }
+    const agent = await Agent.findOne({ id: account.agent_id });
+    if (!agent || !agent.token_hash) {
+      return res.status(401).json({ detail: 'Agent not provisioned' });
+    }
+    const tokenOk = await bcrypt.compare(authHeader.substring(7), agent.token_hash);
+    if (!tokenOk) {
+      return res.status(401).json({ detail: 'Invalid agent token' });
     }
 
     const entityMap: Record<string, any> = {

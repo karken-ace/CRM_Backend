@@ -1,8 +1,7 @@
 import { Router, Response } from 'express';
 import { Agent, Campaign, AdSet, Ad } from '../models';
 import { authenticate, requireRoles, AuthRequest, verifyAgentRequest } from '../middleware/auth';
-import { config } from '../config';
-import axios from 'axios';
+import { agentClient, agentBaseUrl } from '../utils/agentClient';
 
 // Layer 3 staleness threshold: if Mongo's most recent sync for this agent
 // is within MONGO_FRESH_MS, serve from Mongo. Otherwise fall back to a live
@@ -23,18 +22,17 @@ async function getAgentMetaData(agentId: string, endpoint: string): Promise<any>
   }
 
   try {
-    const agentUrl = `${config.agent.baseUrl}/meta/${endpoint}`;
     // 240s — hierarchical campaigns + thumbnails + any brief rate-limit retry in
     // the agent. Must be ≤ nginx proxy_read_timeout (300s) and large enough for
     // Meta's cold-cache response plus one short backoff.
-    const response = await axios.get(agentUrl, { timeout: 240000 });
+    const response = await agentClient(agent).get(`/meta/${endpoint}`, { timeout: 240000 });
     return response.data;
   } catch (error: any) {
     if (error.code === 'ECONNABORTED') {
       throw new Error('Agent request timed out');
     }
     if (error.code === 'ECONNREFUSED') {
-      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + config.agent.baseUrl);
+      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + agentBaseUrl(agent));
     }
     if (error.response) {
       throw new Error(`Agent returned error: ${error.response.status} ${error.response.statusText}`);
@@ -55,8 +53,7 @@ async function updateAgentMetaData(agentId: string, endpoint: string, data: any)
   }
 
   try {
-    const agentUrl = `${config.agent.baseUrl}/meta/${endpoint}`;
-    const response = await axios.put(agentUrl, data, { timeout: 10000 });
+    const response = await agentClient(agent).put(`/meta/${endpoint}`, data, { timeout: 10000 });
     
     // Check for application-level errors in the response
     if (response.data && response.data.status === 'error') {
@@ -70,7 +67,7 @@ async function updateAgentMetaData(agentId: string, endpoint: string, data: any)
       throw new Error('Agent request timed out');
     }
     if (error.code === 'ECONNREFUSED') {
-      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + config.agent.baseUrl);
+      throw new Error('Cannot connect to agent. Make sure the agent is running on ' + agentBaseUrl(agent));
     }
     if (error.response) {
       // If the agent returned an error response, try to extract the message
@@ -669,8 +666,7 @@ router.post('/creatives/thumbnails', authenticate, requireRoles('USER', 'ADMIN')
     if (!agent) return res.status(404).json({ detail: 'Agent not found' });
     if (agent.status !== 'ONLINE') return res.status(503).json({ detail: 'Agent is offline' });
 
-    const agentUrl = `${config.agent.baseUrl}/meta/creatives/thumbnails`;
-    const response = await axios.post(agentUrl, { creative_ids }, { timeout: 60000 });
+    const response = await agentClient(agent).post('/meta/creatives/thumbnails', { creative_ids }, { timeout: 60000 });
     res.json(response.data);
   } catch (error: any) { breakdownErrorHandler(error, res); }
 });

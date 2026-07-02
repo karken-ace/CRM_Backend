@@ -9,10 +9,10 @@
  */
 
 import { Router, Response } from 'express';
-import axios from 'axios';
 import { Agent, ActionLog, CampaignConfig } from '../models';
+import { IAgent } from '../models/Agent';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
-import { config } from '../config';
+import { agentClient } from '../utils/agentClient';
 import {
   enrichArrayWithComputedMetrics,
   getConversions,
@@ -38,14 +38,13 @@ function userAgentQuery(req: AuthRequest): Record<string, unknown> {
 
 /** Fetch the hierarchical campaign tree for one agent over one period.
  *  Returns `[]` on any error so a single bad agent doesn't take the page down. */
-async function fetchHierarchical(period: Period): Promise<any[]> {
+async function fetchHierarchical(agent: IAgent, period: Period): Promise<any[]> {
   try {
-    const url = `${config.agent.baseUrl}/meta/campaigns/hierarchical?date_preset=${period}`;
-    const r = await axios.get(url, { timeout: 60000 });
+    const r = await agentClient(agent).get(`/meta/campaigns/hierarchical?date_preset=${period}`, { timeout: 60000 });
     const root = r.data?.data ?? r.data;
     return root?.campaigns ?? [];
   } catch (e) {
-    console.error('portfolio: hierarchical fetch failed', e);
+    console.error(`portfolio: hierarchical fetch failed for agent ${agent.id}`, e);
     return [];
   }
 }
@@ -86,7 +85,7 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
   try {
     const agents = await Agent.find(userAgentQuery(req));
     const rows = await Promise.all(agents.map(async (agent) => {
-      const campaigns = await fetchHierarchical('last_7d');
+      const campaigns = await fetchHierarchical(agent, 'last_7d');
       const totals = rollupCampaigns(campaigns);
       const roas = totals.spend > 0 ? totals.revenue / totals.spend : 0;
       const target = await deriveAccountTarget(agent.id);
@@ -94,7 +93,7 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
       const status: 'green' | 'amber' | 'red' =
         roas >= target ? 'green' : roas >= target * 0.8 ? 'amber' : 'red';
 
-      const flagCount = await countAgentFlags(agent.id);
+      const flagCount = await countAgentFlags(agent);
       return {
         id: agent.id,
         name: agent.name,
@@ -117,8 +116,8 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
 /** Count the recommendations a given agent would surface in the action queue.
  *  Used as the "Flags" column on the accounts table. We run the same
  *  analyzers /action-queue uses, against the same date range. */
-async function countAgentFlags(agentId: string): Promise<number> {
-  const campaigns = await fetchHierarchical('last_30d');
+async function countAgentFlags(agent: IAgent): Promise<number> {
+  const campaigns = await fetchHierarchical(agent, 'last_30d');
   let count = 0;
   for (const c of campaigns) {
     const adSets = enrichArrayWithComputedMetrics(c.ad_sets ?? []);
@@ -128,9 +127,6 @@ async function countAgentFlags(agentId: string): Promise<number> {
     count += new CreativeFatigueDetector().analyze(adSets).length;
     count += new ScalingOpportunitiesDetector(cfg).analyze(adSets).length;
   }
-  // Unused arg today, but kept on the signature so we can shard counting per
-  // agent once Part B lands and each agent has its own base_url.
-  void agentId;
   return count;
 }
 
@@ -145,8 +141,8 @@ router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: Aut
 
     const agents = await Agent.find(userAgentQuery(req));
     // Sum across all the user's agents. For N=1 this is a single fetch.
-    const totals = (await Promise.all(agents.map(async () => {
-      const campaigns = await fetchHierarchical(period);
+    const totals = (await Promise.all(agents.map(async (agent) => {
+      const campaigns = await fetchHierarchical(agent, period);
       return rollupCampaigns(campaigns);
     }))).reduce((acc, t) => ({
       spend:       acc.spend + t.spend,
@@ -228,7 +224,7 @@ router.post('/action-queue', authenticate, requireRoles('USER', 'ADMIN'), async 
     const allItems: ReturnType<typeof shapeQueueItem>[] = [];
 
     for (const agent of agents) {
-      const campaigns = await fetchHierarchical('last_30d');
+      const campaigns = await fetchHierarchical(agent, 'last_30d');
       for (const c of campaigns) {
         const adSets = enrichArrayWithComputedMetrics(c.ad_sets ?? []);
         if (!adSets.length) continue;
