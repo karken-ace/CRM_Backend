@@ -37,7 +37,9 @@ app.use(requestLogging);
 app.use(generalRateLimiter);
 
 // Routes
-app.use('/healthz', healthRoutes);
+// healthRoutes defines /healthz and /readyz itself — mount at root
+// (previously mounted at /healthz, which made the real path /healthz/healthz)
+app.use('/', healthRoutes);
 app.use('/api/auth', authRateLimiter, authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/agents', agentRoutes);
