@@ -10,6 +10,20 @@ const MONGO_FRESH_MS = 15 * 60 * 1000; // 15 min
 
 const router = Router();
 
+/** Build a `?a=1&b=2` string from the whitelisted query params present on the
+ *  request, so the agent receives the caller's date range/level instead of
+ *  the agent-side defaults. Values are URL-encoded. Returns '' when none set. */
+function forwardQuery(req: AuthRequest, keys: string[]): string {
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = req.query[k];
+    if (typeof v === 'string' && v.length > 0) {
+      parts.push(`${k}=${encodeURIComponent(v)}`);
+    }
+  }
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
 async function getAgentMetaData(agentId: string, endpoint: string): Promise<any> {
   const agent = await Agent.findOne({ id: agentId });
   
@@ -170,7 +184,10 @@ router.get('/insights', authenticate, requireRoles('USER', 'ADMIN'), async (req:
     if (!agent_id || typeof agent_id !== 'string') {
       return res.status(400).json({ detail: 'agent_id is required' });
     }
-    const data = await getAgentMetaData(agent_id, 'insights');
+    // Forward the date range / level so the agent doesn't fall back to its
+    // "account, today" default (which reads as all-zero for paused accounts).
+    const qs = forwardQuery(req, ['date_preset', 'since', 'until', 'level']);
+    const data = await getAgentMetaData(agent_id, `insights${qs}`);
     res.json(data);
   } catch (error: any) {
     if (error.message === 'Agent not found') {
@@ -340,7 +357,8 @@ router.get('/campaigns/:campaign_id/adsets', authenticate, requireRoles('USER', 
     if (!agent_id || typeof agent_id !== 'string') {
       return res.status(400).json({ detail: 'agent_id is required' });
     }
-    const data = await getAgentMetaData(agent_id, `campaigns/${campaign_id}/adsets`);
+    const qs = forwardQuery(req, ['date_preset', 'since', 'until']);
+    const data = await getAgentMetaData(agent_id, `campaigns/${campaign_id}/adsets${qs}`);
     res.json(data);
   } catch (error: any) {
     if (error.message === 'Agent not found') {
