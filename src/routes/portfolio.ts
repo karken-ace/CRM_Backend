@@ -37,6 +37,17 @@ function userAgentQuery(req: AuthRequest): Record<string, unknown> {
   return req.user!.role === 'ADMIN' ? {} : { user_id: req.user!.id };
 }
 
+/** Resolve the agent set a portfolio request should cover: a single agent when
+ *  `agent_id` is supplied (and owned by the caller), else all of the caller's
+ *  agents. Powers the topbar account filter — "all accounts" vs one account. */
+async function scopedAgents(req: AuthRequest, agentId?: unknown) {
+  const query = userAgentQuery(req);
+  if (typeof agentId === 'string' && agentId && agentId !== 'all') {
+    return Agent.find({ ...query, id: agentId });
+  }
+  return Agent.find(query);
+}
+
 /** Sum the standard rollup metrics across a set of ad sets (each carrying a
  *  `performance_metrics` object). All Meta fields are strings — coerce
  *  defensively. Used for both the live-tree path and the Mongo-mirror path. */
@@ -189,7 +200,8 @@ router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: Aut
     }
 
     const { note, cur, prev } = periodWindows(period);
-    const agents = await Agent.find(userAgentQuery(req));
+    // Optional account scope from the topbar dropdown; omitted/'all' → whole portfolio.
+    const agents = await scopedAgents(req, req.query.agent_id);
 
     const [curRows, prevRows] = await Promise.all([
       Promise.all(agents.map(a => fetchAccountInsights(a, cur[0], cur[1]))),
@@ -287,7 +299,8 @@ function shapeQueueItem(
 
 router.post('/action-queue', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
   try {
-    const agents = await Agent.find(userAgentQuery(req));
+    // Account scope may come from the body or query (topbar dropdown).
+    const agents = await scopedAgents(req, req.body?.agent_id ?? req.query.agent_id);
     const allItems: ReturnType<typeof shapeQueueItem>[] = [];
 
     // Read ad sets from the Mongo mirror (fast) instead of a live hierarchical
