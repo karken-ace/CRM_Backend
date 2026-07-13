@@ -44,7 +44,6 @@ Answer in 2–4 short sentences. Use the data above to ground your reply — quo
     try {
       const text = await callClaudeText(systemPrompt, userPrompt, {
         maxTokens: 400,
-        temperature: 0.4,
         timeoutMs: 30000,
       });
       // Strip any accidental markdown fences and normalise whitespace.

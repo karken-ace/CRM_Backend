@@ -26,7 +26,11 @@ export const config = {
     origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   },
   agent: {
+    // Dev-mode fallback only — production agents each carry their own
+    // base_url on the Agent document; resolve via utils/agentClient.
     baseUrl: process.env.AGENT_BASE_URL || 'http://localhost:9000',
+    // Shared secret sent as X-Agent-Key on every backend→agent call.
+    sharedKey: process.env.AGENT_SHARED_KEY || '',
   },
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY || '',

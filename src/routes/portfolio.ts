@@ -9,14 +9,15 @@
  */
 
 import { Router, Response } from 'express';
-import axios from 'axios';
-import { Agent, ActionLog, CampaignConfig } from '../models';
+import { Agent, ActionLog, CampaignConfig, Campaign, AdSet } from '../models';
+import { IAgent } from '../models/Agent';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
-import { config } from '../config';
+import { agentClient } from '../utils/agentClient';
 import {
   enrichArrayWithComputedMetrics,
   getConversions,
   getRevenue,
+  getRegistrations,
 } from '../utils/computedMetrics';
 import {
   BleedingBudgetDetector,
@@ -36,39 +37,58 @@ function userAgentQuery(req: AuthRequest): Record<string, unknown> {
   return req.user!.role === 'ADMIN' ? {} : { user_id: req.user!.id };
 }
 
-/** Fetch the hierarchical campaign tree for one agent over one period.
- *  Returns `[]` on any error so a single bad agent doesn't take the page down. */
-async function fetchHierarchical(period: Period): Promise<any[]> {
-  try {
-    const url = `${config.agent.baseUrl}/meta/campaigns/hierarchical?date_preset=${period}`;
-    const r = await axios.get(url, { timeout: 60000 });
-    const root = r.data?.data ?? r.data;
-    return root?.campaigns ?? [];
-  } catch (e) {
-    console.error('portfolio: hierarchical fetch failed', e);
-    return [];
+/** Resolve the agent set a portfolio request should cover: a single agent when
+ *  `agent_id` is supplied (and owned by the caller), else all of the caller's
+ *  agents. Powers the topbar account filter — "all accounts" vs one account. */
+async function scopedAgents(req: AuthRequest, agentId?: unknown) {
+  const query = userAgentQuery(req);
+  if (typeof agentId === 'string' && agentId && agentId !== 'all') {
+    return Agent.find({ ...query, id: agentId });
   }
+  return Agent.find(query);
 }
 
-/** Sum the standard rollup metrics across every ad set in a campaign tree.
- *  All Meta fields are strings in their API — coerce defensively. */
-function rollupCampaigns(campaigns: any[]): {
+/** Sum the standard rollup metrics across a set of ad sets (each carrying a
+ *  `performance_metrics` object). All Meta fields are strings — coerce
+ *  defensively. Used for both the live-tree path and the Mongo-mirror path. */
+function rollupAdSets(adSets: any[]): {
   spend: number; revenue: number; conversions: number;
   linkClicks: number; impressions: number; clicks: number;
 } {
   let spend = 0, revenue = 0, conversions = 0, linkClicks = 0, impressions = 0, clicks = 0;
-  for (const c of campaigns) {
-    for (const adSet of (c.ad_sets ?? [])) {
-      const m = adSet.performance_metrics ?? {};
-      spend       += parseFloat(m.spend ?? 0);
-      impressions += parseInt(m.impressions ?? 0);
-      clicks      += parseInt(m.clicks ?? 0);
-      linkClicks  += parseInt(m.inline_link_clicks ?? 0);
-      conversions += getConversions(m);
-      revenue     += getRevenue(m);
-    }
+  for (const adSet of adSets) {
+    const m = adSet.performance_metrics ?? {};
+    spend       += parseFloat(m.spend ?? 0) || 0;
+    impressions += parseInt(m.impressions ?? 0) || 0;
+    clicks      += parseInt(m.clicks ?? 0) || 0;
+    linkClicks  += parseInt(m.inline_link_clicks ?? 0) || 0;
+    conversions += getConversions(m);
+    revenue     += getRevenue(m);
   }
   return { spend, revenue, conversions, linkClicks, impressions, clicks };
+}
+
+/** All ad sets for one agent from the Mongo L3 mirror (populated by the
+ *  agent's 5-min sync). This is the fast path — no live agent round-trip —
+ *  and reflects the last_30d sync window the agent runs. */
+async function mirroredAdSets(agentId: string): Promise<any[]> {
+  return AdSet.find({ agent_id: agentId }).lean();
+}
+
+// The agent syncs every 5 min, but Meta rate-limits (code 80004) routinely
+// delay a healthy agent's sync well past that, so a tight threshold false-flags
+// working accounts. 60 min cleanly separates transient rate-limit lag (minutes)
+// from a genuinely blocked/down agent (hours→days, e.g. a blocked Meta app).
+const SYNC_STALE_MS = 60 * 60 * 1000;
+
+/** Freshest sync timestamp for one agent (from the campaign mirror), plus
+ *  whether that's fresh enough to consider Meta connected. */
+async function agentSyncHealth(agentId: string): Promise<{ last_synced_at: Date | null; meta_connected: boolean }> {
+  const doc = await Campaign.findOne({ agent_id: agentId }, { last_synced_at: 1 })
+    .sort({ last_synced_at: -1 }).lean();
+  const last = (doc as any)?.last_synced_at ?? null;
+  const connected = last ? (Date.now() - new Date(last).getTime()) < SYNC_STALE_MS : false;
+  return { last_synced_at: last, meta_connected: connected };
 }
 
 /** Derive an account-level ROAS target from the user's CampaignConfig rows.
@@ -86,15 +106,16 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
   try {
     const agents = await Agent.find(userAgentQuery(req));
     const rows = await Promise.all(agents.map(async (agent) => {
-      const campaigns = await fetchHierarchical('last_7d');
-      const totals = rollupCampaigns(campaigns);
+      const adSets = await mirroredAdSets(agent.id);   // fast — Mongo mirror
+      const totals = rollupAdSets(adSets);
       const roas = totals.spend > 0 ? totals.revenue / totals.spend : 0;
       const target = await deriveAccountTarget(agent.id);
       // Status thresholds mirror the prototype: at target → green; >=80% → amber; else red.
       const status: 'green' | 'amber' | 'red' =
         roas >= target ? 'green' : roas >= target * 0.8 ? 'amber' : 'red';
 
-      const flagCount = await countAgentFlags(agent.id);
+      const flagCount = countAgentFlags(adSets, target);
+      const health = await agentSyncHealth(agent.id);
       return {
         id: agent.id,
         name: agent.name,
@@ -105,6 +126,8 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
         target,
         flags: flagCount,
         agent_status: agent.status,
+        last_synced_at: health.last_synced_at,
+        meta_connected: health.meta_connected,
       };
     }));
     res.json({ accounts: rows });
@@ -114,27 +137,83 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
   }
 });
 
-/** Count the recommendations a given agent would surface in the action queue.
- *  Used as the "Flags" column on the accounts table. We run the same
- *  analyzers /action-queue uses, against the same date range. */
-async function countAgentFlags(agentId: string): Promise<number> {
-  const campaigns = await fetchHierarchical('last_30d');
-  let count = 0;
-  for (const c of campaigns) {
-    const adSets = enrichArrayWithComputedMetrics(c.ad_sets ?? []);
-    if (!adSets.length) continue;
-    const cfg = { target_cpa: undefined, target_roas: 3.0, account_avg_cpa: undefined };
-    count += new BleedingBudgetDetector(cfg).analyze(adSets).length;
-    count += new CreativeFatigueDetector().analyze(adSets).length;
-    count += new ScalingOpportunitiesDetector(cfg).analyze(adSets).length;
-  }
-  // Unused arg today, but kept on the signature so we can shard counting per
-  // agent once Part B lands and each agent has its own base_url.
-  void agentId;
-  return count;
+/** Count the recommendations the analyzers would surface for one agent's ad
+ *  sets — the "Flags" column. Runs the same detectors as /action-queue, over
+ *  the Mongo-mirrored ad sets (no live call). */
+function countAgentFlags(rawAdSets: any[], targetRoas: number): number {
+  const adSets = enrichArrayWithComputedMetrics(rawAdSets);
+  if (!adSets.length) return 0;
+  const cfg = { target_cpa: undefined, target_roas: targetRoas, account_avg_cpa: undefined };
+  return new BleedingBudgetDetector(cfg).analyze(adSets).length
+    + new CreativeFatigueDetector().analyze(adSets).length
+    + new ScalingOpportunitiesDetector(cfg).analyze(adSets).length;
 }
 
 /* ── GET /api/portfolio/kpis?period= ─────────────────────────────────── */
+
+/** YYYY-MM-DD for a date offset by `d` days from today (server clock —
+ *  Meta interprets since/until in the ad account's own timezone, close
+ *  enough for portfolio-level deltas). */
+function isoDay(offset: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Current + previous comparison windows per period. Presets follow Meta's
+ *  own semantics (last_7d/last_30d exclude today). */
+function periodWindows(period: Period) {
+  switch (period) {
+    case 'today':
+      return { note: 'vs yesterday', cur: [isoDay(0), isoDay(0)], prev: [isoDay(-1), isoDay(-1)] };
+    case 'yesterday':
+      return { note: 'vs 2 days ago', cur: [isoDay(-1), isoDay(-1)], prev: [isoDay(-2), isoDay(-2)] };
+    case 'last_7d':
+      return { note: 'vs prior 7 days', cur: [isoDay(-7), isoDay(-1)], prev: [isoDay(-14), isoDay(-8)] };
+    case 'last_30d':
+      return { note: 'vs prior 30 days', cur: [isoDay(-30), isoDay(-1)], prev: [isoDay(-60), isoDay(-31)] };
+  }
+}
+
+/** Account-level insights row for one agent over an explicit window.
+ *  `ok` is false when the live fetch failed (agent returned an error body, e.g.
+ *  a blocked Meta token, or the call threw) — distinct from a valid empty row
+ *  (account simply had no spend). Callers use `ok` to flag Meta as
+ *  disconnected instead of rendering the resulting zeros as real. */
+async function fetchAccountInsights(agent: IAgent, since: string, until: string): Promise<{ row: any; ok: boolean }> {
+  try {
+    const r = await agentClient(agent).get(
+      `/meta/insights?since=${since}&until=${until}&level=account`,
+      { timeout: 60000 },
+    );
+    if (r.data?.status === 'error') return { row: {}, ok: false };
+    return { row: r.data?.data || {}, ok: true };
+  } catch (e) {
+    console.error(`portfolio/kpis: insights fetch failed for agent ${agent.id} (${since}..${until})`, e);
+    return { row: {}, ok: false };
+  }
+}
+
+/** The seven design KPIs from a summed set of account-insight rows. */
+function kpisFromRows(rows: any[]) {
+  let spend = 0, revenue = 0, results = 0, registrations = 0;
+  for (const row of rows) {
+    spend += parseFloat(row.spend ?? 0) || 0;
+    revenue += getRevenue(row);
+    results += getConversions(row);
+    registrations += getRegistrations(row);
+  }
+  return {
+    net_profit: revenue - spend,
+    revenue,
+    results,
+    cost_per_result: results > 0 ? spend / results : 0,
+    registrations,
+    cost_per_registration: registrations > 0 ? spend / registrations : 0,
+    roas: spend > 0 ? revenue / spend : 0,
+    spend,
+  };
+}
 
 router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
   try {
@@ -143,38 +222,67 @@ router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: Aut
       return res.status(400).json({ detail: `period must be one of ${ALL_PERIODS.join(', ')}` });
     }
 
-    const agents = await Agent.find(userAgentQuery(req));
-    // Sum across all the user's agents. For N=1 this is a single fetch.
-    const totals = (await Promise.all(agents.map(async () => {
-      const campaigns = await fetchHierarchical(period);
-      return rollupCampaigns(campaigns);
-    }))).reduce((acc, t) => ({
-      spend:       acc.spend + t.spend,
-      revenue:     acc.revenue + t.revenue,
-      conversions: acc.conversions + t.conversions,
-      linkClicks:  acc.linkClicks + t.linkClicks,
-      impressions: acc.impressions + t.impressions,
-      clicks:      acc.clicks + t.clicks,
-    }), { spend: 0, revenue: 0, conversions: 0, linkClicks: 0, impressions: 0, clicks: 0 });
+    const { note, cur, prev } = periodWindows(period);
+    // Optional account scope from the topbar dropdown; omitted/'all' → whole portfolio.
+    const agents = await scopedAgents(req, req.query.agent_id);
 
-    const cpa  = totals.conversions > 0 ? totals.spend / totals.conversions : 0;
-    const cpc  = totals.linkClicks  > 0 ? totals.spend / totals.linkClicks  : 0;
-    const roas = totals.spend       > 0 ? totals.revenue / totals.spend    : 0;
+    const [curResults, prevResults] = await Promise.all([
+      Promise.all(agents.map(a => fetchAccountInsights(a, cur[0], cur[1]))),
+      Promise.all(agents.map(a => fetchAccountInsights(a, prev[0], prev[1]))),
+    ]);
+
+    const current = kpisFromRows(curResults.map(r => r.row));
+    const previous = kpisFromRows(prevResults.map(r => r.row));
+
+    // Accounts whose live insights fetch failed (blocked/erroring Meta) — their
+    // contribution is 0 here, so flag them rather than passing zeros off as
+    // real. meta_connected is true only when every scoped account fetched OK.
+    const disconnected = agents
+      .filter((_, i) => !curResults[i].ok)
+      .map(a => ({ id: a.id, name: a.name }));
+
+    // Freshest sync timestamp across the portfolio, for the "Synced X min
+    // ago" pill.
+    const lastSync = await Campaign.findOne(
+      { agent_id: { $in: agents.map(a => a.id) } },
+      { last_synced_at: 1 },
+    ).sort({ last_synced_at: -1 }).lean();
 
     res.json({
       period,
-      kpis: {
-        spend:       totals.spend,
-        revenue:     totals.revenue,
-        conversions: totals.conversions,
-        cpa,
-        link_clicks: totals.linkClicks,
-        cpc,
-        roas,
-      },
+      note,
+      synced_at: (lastSync as any)?.last_synced_at ?? null,
+      meta_connected: disconnected.length === 0,
+      disconnected,
+      accounts_total: agents.length,   // lets the UI tell "some" from "all" disconnected
+      kpis: current,
+      previous,
     });
   } catch (error) {
     console.error('portfolio/kpis error:', error);
+    res.status(500).json({ detail: 'Internal server error' });
+  }
+});
+
+/* ── GET /api/portfolio/targets ──────────────────────────────────────── */
+/** Accounts, campaigns, and ad sets across the user's portfolio (from the
+ *  Mongo mirror) — powers the rule-builder scope picker and the activity
+ *  campaign filter. */
+router.get('/targets', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
+  try {
+    const agents = await Agent.find(userAgentQuery(req));
+    const agentIds = agents.map(a => a.id);
+    const [campaigns, adsets] = await Promise.all([
+      Campaign.find({ agent_id: { $in: agentIds } }).select('id name agent_id -_id').lean(),
+      AdSet.find({ agent_id: { $in: agentIds } }).select('id name agent_id campaign_id -_id').lean(),
+    ]);
+    res.json({
+      accounts: agents.map(a => ({ id: a.id, name: a.name, status: a.status })),
+      campaigns,
+      adsets,
+    });
+  } catch (error) {
+    console.error('portfolio/targets error:', error);
     res.status(500).json({ detail: 'Internal server error' });
   }
 });
@@ -224,24 +332,24 @@ function shapeQueueItem(
 
 router.post('/action-queue', authenticate, requireRoles('USER', 'ADMIN'), async (req: AuthRequest, res: Response) => {
   try {
-    const agents = await Agent.find(userAgentQuery(req));
+    // Account scope may come from the body or query (topbar dropdown).
+    const agents = await scopedAgents(req, req.body?.agent_id ?? req.query.agent_id);
     const allItems: ReturnType<typeof shapeQueueItem>[] = [];
 
-    for (const agent of agents) {
-      const campaigns = await fetchHierarchical('last_30d');
-      for (const c of campaigns) {
-        const adSets = enrichArrayWithComputedMetrics(c.ad_sets ?? []);
-        if (!adSets.length) continue;
-        const target_roas = await deriveAccountTarget(agent.id);
-        const cfg = { target_cpa: undefined, target_roas, account_avg_cpa: undefined };
-        const recs: OptimizationRecommendation[] = [
-          ...new BleedingBudgetDetector(cfg).analyze(adSets),
-          ...new CreativeFatigueDetector().analyze(adSets),
-          ...new ScalingOpportunitiesDetector(cfg).analyze(adSets),
-        ];
-        for (const r of recs) allItems.push(shapeQueueItem(r, { id: agent.id, name: agent.name }));
-      }
-    }
+    // Read ad sets from the Mongo mirror (fast) instead of a live hierarchical
+    // fetch per agent. Reflects the agent's most recent 5-min sync.
+    await Promise.all(agents.map(async (agent) => {
+      const adSets = enrichArrayWithComputedMetrics(await mirroredAdSets(agent.id));
+      if (!adSets.length) return;
+      const target_roas = await deriveAccountTarget(agent.id);
+      const cfg = { target_cpa: undefined, target_roas, account_avg_cpa: undefined };
+      const recs: OptimizationRecommendation[] = [
+        ...new BleedingBudgetDetector(cfg).analyze(adSets),
+        ...new CreativeFatigueDetector().analyze(adSets),
+        ...new ScalingOpportunitiesDetector(cfg).analyze(adSets),
+      ];
+      for (const r of recs) allItems.push(shapeQueueItem(r, { id: agent.id, name: agent.name }));
+    }));
 
     // Rank by money at risk, desc. Ties broken by priority weight.
     const priorityWeight: Record<string, number> = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1, OPPORTUNITY: 0 };

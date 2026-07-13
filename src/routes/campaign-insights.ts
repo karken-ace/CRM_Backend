@@ -1,8 +1,7 @@
 import { Router, Response } from 'express';
 import { authenticate, requireRoles, AuthRequest } from '../middleware/auth';
 import { Agent, AdSet } from '../models';
-import { config } from '../config';
-import axios from 'axios';
+import { agentClient } from '../utils/agentClient';
 import { calculateCampaignHealth } from '../utils/campaignOptimizer';
 
 const router = Router();
@@ -35,8 +34,7 @@ router.post('/health', authenticate, requireRoles('USER', 'ADMIN'), async (req: 
     let adSets = await AdSet.find({ agent_id, campaign_id }).lean();
     if (adSets.length === 0) {
       try {
-        const agentUrl = `${config.agent.baseUrl}/meta/campaigns/${campaign_id}/adsets`;
-        const response = await axios.get(agentUrl, { timeout: 15000 });
+        const response = await agentClient(agent).get(`/meta/campaigns/${campaign_id}/adsets`, { timeout: 15000 });
         adSets = response.data?.ad_sets || response.data?.data || [];
       } catch (e) {
         // Fall through — adSets stays empty and we return the 404 below.
@@ -101,8 +99,7 @@ router.post('/quick-wins', authenticate, requireRoles('USER', 'ADMIN'), async (r
     }
     
     // Fetch ad sets
-    const agentUrl = `${config.agent.baseUrl}/meta/campaigns/${campaign_id}/adsets`;
-    const response = await axios.get(agentUrl, { timeout: 15000 });
+    const response = await agentClient(agent).get(`/meta/campaigns/${campaign_id}/adsets`, { timeout: 15000 });
     const adSets = response.data?.ad_sets || response.data?.data || [];
     
     // Calculate health
