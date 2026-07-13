@@ -75,6 +75,22 @@ async function mirroredAdSets(agentId: string): Promise<any[]> {
   return AdSet.find({ agent_id: agentId }).lean();
 }
 
+// The agent syncs every 5 min, but Meta rate-limits (code 80004) routinely
+// delay a healthy agent's sync well past that, so a tight threshold false-flags
+// working accounts. 60 min cleanly separates transient rate-limit lag (minutes)
+// from a genuinely blocked/down agent (hours→days, e.g. a blocked Meta app).
+const SYNC_STALE_MS = 60 * 60 * 1000;
+
+/** Freshest sync timestamp for one agent (from the campaign mirror), plus
+ *  whether that's fresh enough to consider Meta connected. */
+async function agentSyncHealth(agentId: string): Promise<{ last_synced_at: Date | null; meta_connected: boolean }> {
+  const doc = await Campaign.findOne({ agent_id: agentId }, { last_synced_at: 1 })
+    .sort({ last_synced_at: -1 }).lean();
+  const last = (doc as any)?.last_synced_at ?? null;
+  const connected = last ? (Date.now() - new Date(last).getTime()) < SYNC_STALE_MS : false;
+  return { last_synced_at: last, meta_connected: connected };
+}
+
 /** Derive an account-level ROAS target from the user's CampaignConfig rows.
  *  Average of per-campaign targets; falls back to 3.0× if none set. */
 async function deriveAccountTarget(agentId: string): Promise<number> {
@@ -99,6 +115,7 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
         roas >= target ? 'green' : roas >= target * 0.8 ? 'amber' : 'red';
 
       const flagCount = countAgentFlags(adSets, target);
+      const health = await agentSyncHealth(agent.id);
       return {
         id: agent.id,
         name: agent.name,
@@ -109,6 +126,8 @@ router.get('/accounts', authenticate, requireRoles('USER', 'ADMIN'), async (req:
         target,
         flags: flagCount,
         agent_status: agent.status,
+        last_synced_at: health.last_synced_at,
+        meta_connected: health.meta_connected,
       };
     }));
     res.json({ accounts: rows });
@@ -157,17 +176,21 @@ function periodWindows(period: Period) {
 }
 
 /** Account-level insights row for one agent over an explicit window.
- *  Returns zeros on any error so one bad agent doesn't sink the portfolio. */
-async function fetchAccountInsights(agent: IAgent, since: string, until: string): Promise<any> {
+ *  `ok` is false when the live fetch failed (agent returned an error body, e.g.
+ *  a blocked Meta token, or the call threw) — distinct from a valid empty row
+ *  (account simply had no spend). Callers use `ok` to flag Meta as
+ *  disconnected instead of rendering the resulting zeros as real. */
+async function fetchAccountInsights(agent: IAgent, since: string, until: string): Promise<{ row: any; ok: boolean }> {
   try {
     const r = await agentClient(agent).get(
       `/meta/insights?since=${since}&until=${until}&level=account`,
       { timeout: 60000 },
     );
-    return r.data?.data || {};
+    if (r.data?.status === 'error') return { row: {}, ok: false };
+    return { row: r.data?.data || {}, ok: true };
   } catch (e) {
     console.error(`portfolio/kpis: insights fetch failed for agent ${agent.id} (${since}..${until})`, e);
-    return {};
+    return { row: {}, ok: false };
   }
 }
 
@@ -203,13 +226,20 @@ router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: Aut
     // Optional account scope from the topbar dropdown; omitted/'all' → whole portfolio.
     const agents = await scopedAgents(req, req.query.agent_id);
 
-    const [curRows, prevRows] = await Promise.all([
+    const [curResults, prevResults] = await Promise.all([
       Promise.all(agents.map(a => fetchAccountInsights(a, cur[0], cur[1]))),
       Promise.all(agents.map(a => fetchAccountInsights(a, prev[0], prev[1]))),
     ]);
 
-    const current = kpisFromRows(curRows);
-    const previous = kpisFromRows(prevRows);
+    const current = kpisFromRows(curResults.map(r => r.row));
+    const previous = kpisFromRows(prevResults.map(r => r.row));
+
+    // Accounts whose live insights fetch failed (blocked/erroring Meta) — their
+    // contribution is 0 here, so flag them rather than passing zeros off as
+    // real. meta_connected is true only when every scoped account fetched OK.
+    const disconnected = agents
+      .filter((_, i) => !curResults[i].ok)
+      .map(a => ({ id: a.id, name: a.name }));
 
     // Freshest sync timestamp across the portfolio, for the "Synced X min
     // ago" pill.
@@ -222,6 +252,9 @@ router.get('/kpis', authenticate, requireRoles('USER', 'ADMIN'), async (req: Aut
       period,
       note,
       synced_at: (lastSync as any)?.last_synced_at ?? null,
+      meta_connected: disconnected.length === 0,
+      disconnected,
+      accounts_total: agents.length,   // lets the UI tell "some" from "all" disconnected
       kpis: current,
       previous,
     });
